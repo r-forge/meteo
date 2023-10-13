@@ -1,80 +1,43 @@
 rfsi <- function (formula, # without nearest obs
-                  data, # data.frame(x,y,obs,time,ec1,ec2,...) | STFDF - with covariates | SpatialPointsDataFrame | SpatialPixelsDataFrame
-                  data.staid.x.y.time = c(1,2,3,4), # if data.frame
-                  obs, # data.frame(id,time,obs,cov)
-                  obs.staid.time = c(1,2),
-                  stations, # data.frame(id,x,y)
-                  stations.staid.x.y = c(1,2,3),
-                  zero.tol = 0,
-                  n.obs = 10, # nearest obs
+                  data, # sf | sftime | SpatVector | data.frame(x,y,obs,time,ec1,ec2,...)
+                  data.staid.x.y.z = NULL, # = c(1,2,3,4), # if data.frame # time = mid.depth
+                  n.obs = 5, # nearest obs
                   # time.nmax, # use all if not specified
                   avg = FALSE,
                   increment = 10000, # avg(nearest point dist)
                   range = 50000, # bbox smaller(a, b) / 2
-                  direct = FALSE,
+                  quadrant = FALSE,
                   use.idw = FALSE,
                   idw.p = 2,
-                  s.crs = NA,
-                  t.crs = NA,
+                  s.crs = NA, # to ce da leti - ...
+                  p.crs = NA, # to ce da leti - ...
                   cpus = detectCores()-1, # for near.obs
                   progress = TRUE,
-                  ...){ # ranger parameters + quantreg!!!
-  # num.trees,
-  # mtry,
-  # min.node.size,
-  # sample.fraction,
+                  soil3d = FALSE, # soil RFSI
+                  depth.range = 0.1, # in units of depth
+                  no.obs = 'increase', # exactly
+                  ...){ # ranger parameters
+                        # quantreg,
+                        # num.trees,
+                        # mtry,
+                        # min.node.size,
+                        # sample.fraction,
   
   # check the input
   if (progress) print('Preparing data ...')
-  if ((missing(data) & missing(obs) & missing(stations)) | missing(formula)) {
+  if ((missing(data)) | missing(formula)) {
     stop('The arguments data (or obs and stations) and formula must not be empty!')
   }
   formula <- as.formula(formula)
   all_vars <- all.vars(formula)
-  zcol.name <- all_vars[1]
+  obs.col.name <- all_vars[1]
   names_covar <- all_vars[-1]
   
-  if (!missing(data)){
-    if (class(data) == "data.frame") {
-      # if data.staid.x.y.time is character
-      if (!is.numeric(data.staid.x.y.time)) {
-        data.staid.x.y.time <- sapply(data.staid.x.y.time, function(i) index(names(data))[names(data) == i])
-      }
-      data.df = data
-    } else if (class(data) == "STFDF" | class(data) == "STSDF") {
-      if (class(data) == "STSDF") {data <- as(data, "STFDF")}
-      data <- rm.dupl(data, zcol, zero.tol)
-      data.df <- as.data.frame(data)
-      data.staid.x.y.time <- c(3,1,2,4)
-      if (!is.na(data@sp@proj4string)) {
-        s.crs <- data@sp@proj4string
-      }
-    } else if (class(data) == "SpatialPointsDataFrame" | class(data) == "SpatialPixelsDataFrame") {
-      data.df <- as.data.frame(data)
-      data.df$staid <- 1:nrow(data.df)
-      data.staid.x.y.time <- c(length(data.df),length(data.df)-2,length(data.df)-1,NA)
-      if (!is.na(data@sp@proj4string)) {
-        s.crs <- data@proj4string
-      }
-    } else {
-      stop('The argument data must be of STFDF, STSDF, data.frame,SpatialPointsDataFrame or SpatialPixelsDataFrame class!') # "STSDF"
-    }
-  } else { # obs, stations
-    # if obs.staid.time is character
-    if (!is.numeric(obs.staid.time)) {
-      obs.staid.time <- sapply(obs.staid.time, function(i) index(names(obs))[names(obs) == i])
-    }
-    # if stations.staid.x.y is character
-    if (!is.numeric(stations.staid.x.y)) {
-      stations.staid.x.y <- sapply(stations.staid.x.y, function(i) index(names(stations))[names(stations) == i])
-    }
-    # to stfdf
-    data.df <- join(obs, stations, by=names(obs)[obs.staid.time[1]], match="first")
-    data.staid.x.y.time <- c(obs.staid.time[1],
-                             stations.staid.x.y[2] + length(obs),
-                             stations.staid.x.y[3] + length(obs),
-                             obs.staid.time[2])
-  }
+  # prepare data
+  data.prep <- data.prepare(data=data, data.staid.x.y.z=data.staid.x.y.z, s.crs=s.crs)
+  data.df <- data.prep[["data.df"]]
+  data.staid.x.y.z <- data.prep[["data.staid.x.y.z"]]
+  s.crs <- data.prep[["s.crs"]]
   
   # if vars exists
   c.dif <- setdiff(all_vars, names(data.df))
@@ -83,42 +46,51 @@ rfsi <- function (formula, # without nearest obs
   }
   
   if (is.na(s.crs)) {
-    warning('Source CRS is NA! Using given coordinates for Euclidean distances calculation.')
-  } else if (is.na(t.crs)) {
-    if (progress) print('Targed CRS is NA. Using source CRS for Euclidean distances calculation:')
-    if (progress) print(s.crs)
+    warning('Source CRS is NULL! Using given coordinates for Euclidean distances calculation.')
+  } else if (is.na(p.crs)) {
+    if (progress) print('Projection CRS is NULL. Using source CRS for Euclidean distances calculation:')
+    if (progress) print(s.crs$input)
+  } else if (identical(s.crs, p.crs)) {
+    if (progress) print('s.crs==p.crs')
   } else {
-    if (progress) print('Using target CRS for Euclidean distances calculation. Do reprojection from:')
-    if (progress) print(s.crs)
-    if (progress) print('to:')
-    if (progress) print(t.crs)
-    data.coord <- data.df[, data.staid.x.y.time[2:3]]
-    coordinates(data.coord) <- names(data.coord)
-    data.coord@proj4string <- s.crs
-    data.coord <- spTransform(data.coord, t.crs)
-    data.coord <- as.data.frame(data.coord)
+    if (progress) print('Using projection CRS for Euclidean distances calculation.')
+    prj_print <- try(paste('Do reprojection from: ', s.crs$input, ' to ', p.crs$input, sep=""), silent = TRUE)
+    if(inherits(prj_print, "try-error")) {
+      prj_print <- paste('Do reprojection from: ', s.crs@projargs, ' to ', p.crs@projargs, sep="")
+    }
+    if (progress) print(prj_print)
+    # if (progress) print(paste('Do reprojection from: ', s.crs$input, ' to ', p.crs$input, sep=""))
+    # reproject data coordinates
+    data.coord <- data.df[, data.staid.x.y.z[2:3]]
+    data.coord <- st_as_sf(data.coord, coords = names(data.coord), crs = s.crs, agr = "constant")
+    data.coord <- st_transform(data.coord, p.crs)
+    data.coord <- as.data.frame(st_coordinates(data.coord$geometry))
     names(data.coord) <- c('x.proj', 'y.proj')
     data.df <- cbind(data.df, data.coord)
-    data.staid.x.y.time[2:3] <- c(length(data.df)-1, length(data.df))
+    data.staid.x.y.z[2:3] <- c(length(data.df)-1, length(data.df))
   }
   
-  x.y <- names(data.df)[data.staid.x.y.time[2:3]]
-  data.df = data.df[complete.cases(data.df), ]
+  x.y <- names(data.df)[data.staid.x.y.z[2:3]]
+  data.df = data.df[complete.cases(data.df[, names_covar]), ]
+  if (soil3d) {
+    depth.name <- names(data.df)[data.staid.x.y.z[4]]
+  }
   
   # if space-time
-  if (!is.na(data.staid.x.y.time[4])) {
+  if (!is.na(data.staid.x.y.z[4]) & !soil3d) {
     # sort data.df
-    data.df <- data.df[order(data.df[, data.staid.x.y.time[4]],
-                             data.df[, data.staid.x.y.time[1]]), ]
-    time=sort(unique(data.df[, data.staid.x.y.time[4]]))
+    data.df <- data.df[order(data.df[, data.staid.x.y.z[4]],
+                             data.df[, data.staid.x.y.z[1]]), ]
+    time=sort(unique(data.df[, data.staid.x.y.z[4]]))
     daysNum = length(time)
     
     # calculate obs and dist
+    if (progress) print('Space-time process ...')
     if (progress) print('Calculating distances to the nearest observations ...')
     registerDoParallel(cores=cpus)
     nearest_obs <- foreach (t = time, .export = c("near.obs")) %dopar% {
       
-      day_df <- data.df[data.df[, data.staid.x.y.time[4]]==t, c(x.y, zcol.name)]
+      day_df <- data.df[data.df[, data.staid.x.y.z[4]]==t, c(x.y, obs.col.name)]
       if (nrow(day_df)==0) {
         return(NULL)
       }
@@ -127,12 +99,12 @@ rfsi <- function (formula, # without nearest obs
         # locations.x.y = c(1,2),
         observations = day_df,
         # observations.x.y = c(1,2),
-        zcol = zcol.name,
+        obs.col = obs.col.name,
         n.obs = n.obs,
         avg = avg,
         range = range,
         increment = increment,
-        direct = direct,
+        quadrant = quadrant,
         idw=use.idw,
         idw.p=idw.p
       ))
@@ -146,7 +118,7 @@ rfsi <- function (formula, # without nearest obs
     #   if (progress) print('Calculating TPS ...')
     #   registerDoParallel(cores=cpus)
     #   tps_fit <- foreach (t = time) %dopar% {
-    #     day_df <- data.df[data.df[, data.staid.x.y.time[4]]==t, c(x.y, zcol.name)]
+    #     day_df <- data.df[data.df[, data.staid.x.y.z[4]]==t, c(x.y, obs.col.name)]
     #     if (nrow(day_df)==0) {
     #       return(NULL)
     #     }
@@ -155,7 +127,7 @@ rfsi <- function (formula, # without nearest obs
     #     } else {
     #       tps.df.day <- tps.df
     #     }
-    #     m <- Tps(day_df[, x.y], day_df[, zcol.name],# lon.lat = T,
+    #     m <- Tps(day_df[, x.y], day_df[, obs.col.name],# lon.lat = T,
     #              #lambda = tps.lambda) #, GCV=F)
     #              df=tps.df.day)
     #     return(as.vector(m$fitted.values))
@@ -164,33 +136,53 @@ rfsi <- function (formula, # without nearest obs
     #   tps_fit <- unlist(tps_fit) #as.vector(do.call("rbind", tps_fit))
     # }
     
+  } else if (!is.na(data.staid.x.y.z[4]) & soil3d) { # soil 3D
+    # calculate obs and dist
+    day_df <- data.df[, c(x.y, depth.name, obs.col.name)]
+    if (progress) print('Soil 3D process ...')
+    if (progress) print('Calculating distances to the nearest observations (profiles) ...')
+    nearest_obs <- near.obs.soil(
+      locations = day_df,
+      # locations.x.y.md = c(1,2,3),
+      observations = day_df,
+      # observations.x.y.md = c(1,2,3),
+      obs.col = 4,
+      n.obs = n.obs,
+      depth.range = depth.range,
+      no.obs = no.obs,
+      parallel.processing = TRUE,
+      pp.type = "doParallel", # "snowfall"
+      cpus = cpus
+    )
+    
   } else { # if spatial
     # calculate obs and dist
-      day_df <- data.df[, c(x.y, zcol.name)]
-      if (progress) print('Calculating distances to the nearest observations ...')
-      nearest_obs <- near.obs(
-        locations = day_df,
-        # locations.x.y = c(1,2),
-        observations = day_df,
-        # observations.x.y = c(1,2),
-        zcol = zcol.name,
-        n.obs = n.obs,
-        avg = avg,
-        range = range,
-        increment = increment,
-        direct = direct,
-        idw=use.idw,
-        idw.p=idw.p
-      )
-      
-      # # calculate TPS
-      # if (use.tps) {
-      #   if (progress) print('Calculating TPS ...')
-      #   m <- Tps(day_df[, x.y], day_df[, zcol.name],# lon.lat = T,
-      #            # lambda = tps.lambda) #, GCV=F)
-      #            df=tps.df)
-      #   tps_fit <- as.vector(m$fitted.values)
-      # }
+    day_df <- data.df[, c(x.y, obs.col.name)]
+    if (progress) print('Spatial process ...')
+    if (progress) print('Calculating distances to the nearest observations ...')
+    nearest_obs <- near.obs(
+      locations = day_df,
+      # locations.x.y = c(1,2),
+      observations = day_df,
+      # observations.x.y = c(1,2),
+      obs.col = obs.col.name,
+      n.obs = n.obs,
+      avg = avg,
+      range = range,
+      increment = increment,
+      quadrant = quadrant,
+      idw=use.idw,
+      idw.p=idw.p
+    )
+    
+    # # calculate TPS
+    # if (use.tps) {
+    #   if (progress) print('Calculating TPS ...')
+    #   m <- Tps(day_df[, x.y], day_df[, obs.col.name],# lon.lat = T,
+    #            # lambda = tps.lambda) #, GCV=F)
+    #            df=tps.df)
+    #   tps_fit <- as.vector(m$fitted.values)
+    # }
   }
   
   data.df <- cbind(data.df, nearest_obs)
@@ -199,7 +191,7 @@ rfsi <- function (formula, # without nearest obs
   #   data.df[, tps.var] <- tps_fit
   # }
 
-  data.df = data.df[complete.cases(data.df), ]
+  data.df = data.df[complete.cases(data.df[, c(names_covar, names(nearest_obs))]), ]
   if (nrow(data.df) == 0) {
     stop("There is no complete cases in data.")
   }
@@ -207,8 +199,9 @@ rfsi <- function (formula, # without nearest obs
   # if (use.tps) {
   #   formula = as.formula(paste(deparse(formula), paste(names(nearest_obs), collapse = " + "), tps.var, sep = " + "))
   # } else {
-  formula = as.formula(paste(deparse(formula), paste(names(nearest_obs), collapse = " + "), sep = " + "))
+  formula = as.formula(paste(paste((deparse(formula)), collapse=""), paste(names(nearest_obs), collapse = " + "), sep = " + "))
   # }
+  rm(nearest_obs)
   
   # fit RF model
   if (progress) print('Fitting RFSI model ...')
@@ -220,5 +213,8 @@ rfsi <- function (formula, # without nearest obs
   if (progress) print('Done!')
   
   return(rfsi_model)
+  # dodaj formulu
+  # dodaj n.obs
+  # avg ...
   
 }

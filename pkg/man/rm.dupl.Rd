@@ -16,10 +16,11 @@ This function finds point pairs with equal spatial coordinates from \link[spacet
 \author{Milan Kilibarda \email{kili@grf.bg.ac.rs}
 }
 \seealso{
-\code{\link{tgeom2STFDF}}
+\code{\link{tgeom2STFDF}},
 \code{\link{pred.strk}}
 }
 \examples{
+library(sp)
 # load observation - data frame
 data(dtempc) 
 # load stations - data frame
@@ -27,13 +28,18 @@ data(stations)
 
 str(dtempc)
 str(stations)
-# create STFDF
-temp <- meteo2STFDF(dtempc,stations) # create STFDF from 2 data frames
+
+\dontrun{
+# create STFDF - from 2 data frames
+temp <- meteo2STFDF(dtempc,
+                    stations,
+                    crs = CRS('+proj=longlat +datum=WGS84'))
 
 nrow(temp@sp) # number of stations before removing dupl.
 
-temp2 <-rm.dupl(temp)
+temp2 <-rm.dupl(temp, zcol = 1, zero.tol = 50) # 50 km
 nrow(temp2@sp) # number of stations after
+}
 }
 
 
